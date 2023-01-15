@@ -14,6 +14,9 @@
 #include <vector>
 #include <algorithm>
 
+#include <mutex>
+#include <thread>
+
 #define MY_DEBUG
 
 using TSampleInput          = TSampleF;
@@ -35,7 +38,25 @@ int main(int argc, char ** argv) {
 
     const auto argm = parseCmdArguments(argc, argv);
     const int filterId      = argm.count("F") == 0 ? EAudioFilter::FirstOrderHighPass : std::stoi(argm.at("F"));
-    const int freqCutoff_Hz = argm.count("f") == 0 ? kFreqCutoff_Hz : std::stoi(argm.at("f"));
+
+    int freqCutoff_Hz = argm.count("f") == 0 ? 0 : std::stoi(argm.at("f"));
+
+    Cipher::TFreqMap freqMap6;
+    {
+        const auto tStart = std::chrono::high_resolution_clock::now();
+
+        printf("[+] Loading n-grams from '%s'\n", argv[2]);
+
+        if (Cipher::loadFreqMapBinary((std::string(argv[2]) + "/ggwords-6-gram.dat.binary").c_str(), freqMap6) == false) {
+            return -5;
+        }
+
+        const auto tEnd = std::chrono::high_resolution_clock::now();
+
+        printf("[+] Loading took %4.3f seconds\n", toSeconds(tStart, tEnd));
+    }
+
+    // Main algorithm
 
     TWaveform waveformInput;
     {
@@ -45,6 +66,15 @@ int main(int argc, char ** argv) {
             printf("Specified file '%s' does not exist\n", argv[1]);
             return -1;
         } else {
+            if (freqCutoff_Hz == 0) {
+                const auto tStart = std::chrono::high_resolution_clock::now();
+
+                freqCutoff_Hz = Cipher::findBestCutoffFreq(waveformInputF, (EAudioFilter) filterId, kSampleRate, 100.0f, 1000.0f, 100.0f);
+
+                const auto tEnd = std::chrono::high_resolution_clock::now();
+                printf("[+] Found best freqCutoff = %d Hz, took %4.3f seconds\n", freqCutoff_Hz, toSeconds(tStart, tEnd));
+            }
+
             printf("[+] Filtering waveform with filter type = %d and cutoff frequency = %d Hz\n", filterId, freqCutoff_Hz);
             ::filter(waveformInputF, (EAudioFilter) filterId, freqCutoff_Hz, kSampleRate);
 
@@ -70,7 +100,8 @@ int main(int argc, char ** argv) {
 
         TWaveform waveformMax;
         TWaveform waveformThreshold;
-        if (findKeyPresses(getView(waveformInput, 0), keyPresses, waveformThreshold, waveformMax, 8.0, 512, 2*1024, true) == false) {
+        if (findKeyPresses(getView(waveformInput, 0), keyPresses, waveformThreshold, waveformMax,
+                           kFindKeysThreshold, kFindKeysHistorySize, kFindKeysHistorySizeReset, kFindKeysRemoveLowPower) == false) {
             printf("Failed to detect keypresses\n");
             return -2;
         }
@@ -81,7 +112,7 @@ int main(int argc, char ** argv) {
         printf("[+] Search took %4.3f seconds\n", toSeconds(tStart, tEnd));
     }
 
-    const int n = keyPresses.size();
+    int n = keyPresses.size();
 
     TSimilarityMap similarityMap;
     {
@@ -89,7 +120,7 @@ int main(int argc, char ** argv) {
 
         printf("[+] Calculating CC similarity map\n");
 
-        if (calculateSimilartyMap(2*256, 3*32, 2*256 - 128, keyPresses, similarityMap) == false) {
+        if (calculateSimilartyMap(kKeyWidth_samples, kKeyAlign_samples, kKeyWidth_samples - kKeyOffset_samples, keyPresses, similarityMap) == false) {
             printf("Failed to calculate similariy map\n");
             return -3;
         }
@@ -97,6 +128,27 @@ int main(int argc, char ** argv) {
         const auto tEnd = std::chrono::high_resolution_clock::now();
 
         printf("[+] Calculation took %4.3f seconds\n", toSeconds(tStart, tEnd));
+
+        {
+            const auto tStart = std::chrono::high_resolution_clock::now();
+
+            printf("[+] Removing low-similarity keys\n");
+
+            const int n0 = keyPresses.size();
+
+            if (removeLowSimilarityKeys(keyPresses, similarityMap, 0.3f) == false) {
+                printf("Failed to remove low-similarity keys\n");
+                return -4;
+            }
+
+            const int n1 = keyPresses.size();
+
+            const auto tEnd = std::chrono::high_resolution_clock::now();
+
+            printf("[+] Removed %d low-similarity keys, took %4.3f seconds\n", n0 - n1, toSeconds(tStart, tEnd));
+        }
+
+        n = keyPresses.size();
 
         const int ncc = std::min(32, n);
         for (int j = 0; j < ncc; ++j) {
@@ -120,31 +172,17 @@ int main(int argc, char ** argv) {
         printf("[+] Similarity map: min = %g, max = %g\n", minCC, maxCC);
     }
 
-    Cipher::TFreqMap freqMap6;
-    {
-        const auto tStart = std::chrono::high_resolution_clock::now();
+    printf("[+] Attempting to recover the text from the recording ...\n");
 
-        printf("[+] Loading n-grams from '%s'\n", argv[2]);
-
-        if (Cipher::loadFreqMapBinary((std::string(argv[2]) + "/ggwords-6-gram.dat.binary").c_str(), freqMap6) == false) {
-            return -5;
-        }
-
-        const auto tEnd = std::chrono::high_resolution_clock::now();
-
-        printf("[+] Loading took %4.3f seconds\n", toSeconds(tStart, tEnd));
-    }
-
-    {
+    for (int iMain = 0; iMain < 16; ++iMain) {
         Cipher::Processor processor;
 
         Cipher::TParameters params;
-        params.maxClusters = 29;
-        params.wEnglishFreq = 20.0;
-        params.nHypothesesToKeep = std::max(100, 2100 - 10*std::min(200, std::max(0, ((int) keyPresses.size() - 100))));
+        params.maxClusters = 30;
+        params.wEnglishFreq = 30.0;
+        params.fSpread = 0.5 + 0.1*iMain;
+        params.nHypothesesToKeep = std::max(100, 500 - 2*std::min(200, std::max(0, ((int) keyPresses.size() - 100))));
         processor.init(params, freqMap6, similarityMap);
-
-        printf("[+] Attempting to recover the text from the recording ...\n");
 
         std::vector<Cipher::TResult> clusterings;
 
@@ -153,14 +191,13 @@ int main(int argc, char ** argv) {
             const auto tStart = std::chrono::high_resolution_clock::now();
 
             for (int nIter = 0; nIter < 16; ++nIter) {
-                auto clusteringsCur = processor.getClusterings(params, 32);
+                auto clusteringsCur = processor.getClusterings(2);
 
                 for (int i = 0; i < (int) clusteringsCur.size(); ++i) {
-                    printf("[+] Clustering %d: pClusters = %g\n", i, clusteringsCur[i].pClusters);
                     clusterings.push_back(std::move(clusteringsCur[i]));
                 }
 
-                params.maxClusters = 29 + 4*(nIter + 1);
+                params.maxClusters = 30 + 4*(nIter + 1);
                 processor.init(params, freqMap6, similarityMap);
             }
 
@@ -171,94 +208,28 @@ int main(int argc, char ** argv) {
         params.hint.clear();
         params.hint.resize(n, -1);
 
-        [[maybe_unused]] int nConverged = 0;
-        while (true) {
-            // beam search
-            {
-                for (int i = 0; i < (int) clusterings.size(); ++i) {
-                    Cipher::beamSearch(params, freqMap6, clusterings[i]);
-                    printf("%8.3f %8.3f ", clusterings[i].p, clusterings[i].pClusters);
-                    Cipher::printDecoded(clusterings[i].clusters, clusterings[i].clMap, params.hint);
-                    Cipher::refineNearby(params, freqMap6, clusterings[i]);
-                }
+        // beam search
+        int nThread = std::min((int) std::thread::hardware_concurrency(), (int) clusterings.size());
+        {
+            std::vector<std::thread> workers(nThread);
+
+            std::mutex mutexPrint;
+            for (int i = 0; i < nThread; ++i) {
+                workers[i] = std::thread([&, i]() {
+                    for (int j = i; j < (int) clusterings.size(); j += nThread) {
+                        Cipher::beamSearch(params, freqMap6, clusterings[j]);
+                        mutexPrint.lock();
+                        printf(" ");
+                        Cipher::printDecoded(clusterings[j].clusters, clusterings[j].clMap, params.hint);
+                        printf(" [%8.3f %8.3f]\n", clusterings[j].p, clusterings[j].pClusters);
+                        mutexPrint.unlock();
+                    }
+                });
             }
-            break;
 
-            // hint refinement
-            //{
-            //    const auto tStart = std::chrono::high_resolution_clock::now();
-
-            //    std::vector<std::map<int, int>> nOccurances(n);
-            //    for (int i = 0; i < (int) clusterings.size(); ++i) {
-            //        for (int j = 0; j < n; ++j) {
-            //            nOccurances[j][Cipher::decode(clusterings[i].clusters, j, clusterings[i].clMap, params.hint)]++;
-            //        }
-            //    }
-
-            //    // for each position j determine the most frequent cluster
-            //    struct Entry {
-            //        int pos;
-            //        TLetter letter;
-            //        int nOccurances;
-            //    };
-
-            //    std::vector<Entry> mostFrequentClusters(n);
-            //    for (int j = 0; j < n; ++j) {
-            //        int maxOccurances = 0;
-            //        for (const auto& p : nOccurances[j]) {
-            //            if (p.second > maxOccurances) {
-            //                maxOccurances = p.second;
-            //                mostFrequentClusters[j].pos = j;
-            //                mostFrequentClusters[j].letter = p.first;
-            //                mostFrequentClusters[j].nOccurances = p.second;
-            //            }
-            //        }
-            //    }
-
-            //    std::sort(mostFrequentClusters.begin(), mostFrequentClusters.end(), [](const Entry& a, const Entry& b) {
-            //        return a.nOccurances > b.nOccurances;
-            //    });
-
-            //    [[maybe_unused]] bool converged = true;
-            //    for (int i = 0; i < (int) clusterings.size(); ++i) {
-            //        for (int j = 0; j < n; ++j) {
-            //            if (mostFrequentClusters[j].nOccurances > (int) (0.90*clusterings.size())) {
-            //                if (params.hint[mostFrequentClusters[j].pos] != mostFrequentClusters[j].letter &&
-            //                    mostFrequentClusters[j].letter != 27 &&
-            //                    mostFrequentClusters[j].letter != 'e' - 'a' + 1) {
-            //                    params.hint[mostFrequentClusters[j].pos] = mostFrequentClusters[j].letter;
-            //                    converged = false;
-            //                    if (i == 0) {
-            //                        printf("    - %2d: pos = %d, %c %d\n", i, mostFrequentClusters[j].pos, 'a' + mostFrequentClusters[j].letter - 1, mostFrequentClusters[j].nOccurances);
-            //                    }
-            //                }
-            //            }
-            //        }
-            //    }
-
-            //    const auto tEnd = std::chrono::high_resolution_clock::now();
-            //    printf("[+] Hint refinement took %4.3f seconds\n", toSeconds(tStart, tEnd));
-            //}
-
-            //if (converged) {
-            //    ++nConverged;
-            //    printf("[+] Converged %d times\n", nConverged);
-            //    if (nConverged > 0) {
-            //        break;
-            //    }
-            //} else {
-            //    nConverged = 0;
-            //}
-
-            //for (int i = 0; i < (int) clusterings.size(); ++i) {
-            //    for (int j = 0; j < n; ++j) {
-            //        for (int k = 0; k < n; ++k) {
-            //            if (params.hint[j] != -1 && params.hint[j] == params.hint[k]) {
-            //                clusterings[i].clusters[k] = clusterings[i].clusters[j];
-            //            }
-            //        }
-            //    }
-            //}
+            for (auto& worker : workers) {
+                worker.join();
+            }
         }
     }
 

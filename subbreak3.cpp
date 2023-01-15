@@ -703,17 +703,17 @@ namespace Cipher {
         hypothesesCur.resize(nHypothesesToKeep);
         hypothesesNew.resize(nHypothesesToKeep*nSymbols);
 
-        int nHints = 0;
         {
             auto & hcur = hypothesesCur[0];
             hcur = { 0.0, getNullCLMap(clusters), {}, std::vector<int>(nSymbols + 1, 0), {}};
-            translate(hcur.clMap, clusters, hcur.plain);
             for (int i = 0; i < (int) params.hint.size(); ++i) {
                 if (params.hint[i] != -1) {
-                    hcur.plain[i] = params.hint[i];
-                    ++nHints;
+                    if (frand() > 0.5) {
+                        hcur.clMap[clusters[i]] = params.hint[i];
+                    }
                 }
             }
+            translate(hcur.clMap, clusters, hcur.plain);
             hcur.memo.resize(N, 1.0);
             hcur.p = calcScore(params, freqMap, hcur.plain, hcur.memo);
             ++nCur;
@@ -742,6 +742,10 @@ namespace Cipher {
 
             //printf("Processing cluster %2d ('%c') - count = %d\n", kvSorted.first, getEncodedChar(kvSorted.first), (int) kvSorted.second.size());
 
+            if (hypothesesCur[0].clMap.at(kvSorted.first) != 0) {
+                continue;
+            }
+
             int nNew = 0;
             for (int j = 0; j < nCur; ++j) {
                 const auto & hcur = hypothesesCur[j];
@@ -757,9 +761,6 @@ namespace Cipher {
                     hnew.nused[a]++;
                     for (int k = 0; k < (int) kvSorted.second.size(); ++k) {
                         const auto idx = kvSorted.second[k];
-                        if ((int) params.hint.size() > idx && params.hint[idx] != -1) {
-                            continue;
-                        }
                         hnew.plain[idx] = a;
 
                         const auto idx0 = std::max(0, idx - freqMap.len + 1);
@@ -847,8 +848,8 @@ namespace Cipher {
                 if (converged) break;
             }
 
-            printf("%8.3f %8.3f ", (double) hbest.p, (double) result.p);
             printPlain(hbest.plain);
+            printf(" [%8.3f %8.3f]", (double) hbest.p, (double) result.p);
         }
 
         return true;
@@ -940,7 +941,10 @@ namespace Cipher {
         for (int i = 0; i < 1; ++i) {
             int idx = rand()%n;
 
-            clusters[idx] = 1 + rand()%(params.maxClusters - 1);
+            auto old = clusters[idx];
+            do {
+                clusters[idx] = 1 + rand()%(params.maxClusters - 1);
+            } while (clusters[idx] == old);
         }
 
         return true;
@@ -971,7 +975,7 @@ namespace Cipher {
     }
 
     bool normalizeSimilarityMap(
-            const TParameters & ,
+            const TParameters & params,
             TSimilarityMap & ccMap,
             TSimilarityMap & logMap,
             TSimilarityMap & logMapInv) {
@@ -1000,12 +1004,11 @@ namespace Cipher {
                 }
 
                 auto & v = ccMap[j][i].cc;
-                //v = (v - ccMin)/(ccMax - ccMin);
-                if (v < 0.50*(ccMin + ccMax)) {
-                    v = ccMin;
-                } else {
-                    v = (v - ccMin)/(ccMax - ccMin);
-                }
+                v = (v - ccMin)/(ccMax - ccMin);
+                v = std::pow(v, params.fSpread);
+                //if (v < 0.50) {
+                //    v = 1e-6;
+                //}
                 //v = 1.0 - std::exp(-1.1f*v);
             }
         }
@@ -1065,8 +1068,6 @@ namespace Cipher {
         for (const auto & cid : t) {
             printf("%c", getEncodedChar(cid));
         }
-
-        printf("\n");
     }
 
     void printDecoded(const TClusters & t, const TClusterToLetterMap & clMap, const THint & hint) {
@@ -1081,8 +1082,6 @@ namespace Cipher {
                 printf(".");
             }
         }
-
-        printf("\n");
     }
 
     void printPlain(const std::vector<TLetter> & t) {
@@ -1097,8 +1096,6 @@ namespace Cipher {
                 printf(".");
             }
         }
-
-        printf("\n");
     }
 
     //
@@ -1135,28 +1132,62 @@ namespace Cipher {
         return true;
     }
 
-    std::vector<TResult> Processor::getClusterings(const TParameters & params, int nClusterings) {
+    std::vector<TResult> Processor::getClusterings(int nClusterings) {
         const auto p0 = m_curResult.pClusters;
-        printf("    [getClusterings] p0 = %g\n", p0);
+        //printf("    [getClusterings] p0 = %g\n", p0);
 
         int nNoImprovement = 0;
         int nTotalIterations = 0;
         auto clustersNew = m_curResult.clusters;
+        const int n = clustersNew.size();
 
         std::vector<TResult> all;
         all.push_back(m_curResult);
 
         // simulated annealing
-        double T = params.temp0;
-        double TMin = 0.000001;
-        double alpha = params.coolingRate;
+        double T = m_params.temp0;
+        const double TMin = 0.000001;
+        const double alpha = m_params.coolingRate;
+        const double pScale = ((n*(n-1))/2.0);
 
         while (true) {
             clustersNew = m_curResult.clusters;
-            Cipher::mutateClusters(m_params, clustersNew);
 
-            // m_pCur is the old value
-            const auto pNew = calcPClusters(m_params, m_similarityMap, m_logMap, m_logMapInv, clustersNew, m_curResult.clMap);
+            // mutate
+            int idxChanged = -1;
+            {
+                idxChanged = rand()%n;
+
+                auto old = clustersNew[idxChanged];
+                do {
+                    clustersNew[idxChanged] = 1 + rand()%(m_params.maxClusters - 1);
+                } while (clustersNew[idxChanged] == old);
+            }
+
+            // compute pNew
+            auto pNew = m_pCur*pScale;
+            {
+                const int j = idxChanged;
+                for (int i = 0; i < n; ++i) {
+                    if (i == j) {
+                        continue;
+                    }
+
+                    if (m_curResult.clusters[i] == m_curResult.clusters[j]) {
+                        pNew -= m_logMap[j][i].cc;
+                    } else {
+                        pNew -= m_logMapInv[j][i].cc;
+                    }
+
+                    if (clustersNew[i] == clustersNew[j]) {
+                        pNew += m_logMap[j][i].cc;
+                    } else {
+                        pNew += m_logMapInv[j][i].cc;
+                    }
+                }
+
+                pNew /= pScale;
+            }
 
             // check if we should accept the new value
             if (pNew >= m_pCur) {
@@ -1167,7 +1198,7 @@ namespace Cipher {
                 // accept with probability
                 const auto pAccept = std::exp((pNew - m_pCur)/T);
                 if (pAccept > frand()) {
-                    //printf("    [getClusterings] N = %d, T = %8.3f, pNew = %g, pCur = %g, pAccept = %g\n", nNoImprovement, T, pNew, m_pCur, pAccept);
+                    //printf("    [getClusterings] N = %5d, T = %8.8f, pNew = %g, pCur = %g, pAccept = %g\n", nNoImprovement, T, pNew, m_pCur, pAccept);
                     m_curResult.clusters = clustersNew;
                     m_curResult.pClusters = pNew;
                     m_pCur = pNew;
@@ -1197,8 +1228,8 @@ namespace Cipher {
             }
         }
 
-        printf("    [getClusterings] nTotalIterations = %d\n", nTotalIterations);
-        printf("    [getClusterings] pFinal = %g\n", m_curResult.pClusters);
+        //printf("    [getClusterings] nTotalIterations = %d\n", nTotalIterations);
+        //printf("    [getClusterings] pFinal = %g\n", m_curResult.pClusters);
 
         const auto pClustersBest = all.back().pClusters;
 
@@ -1242,29 +1273,10 @@ namespace Cipher {
     }
 
     bool Processor::compute() {
-        auto clustersNew = m_curResult.clusters;
-
-        for (int iter = 0; iter < m_params.nIters; ++iter) {
-            clustersNew = m_curResult.clusters;
-            Cipher::mutateClusters(m_params, clustersNew);
-            const auto pNew = calcPClusters(m_params, m_similarityMap, m_logMap, m_logMapInv, clustersNew, m_curResult.clMap);
-
-            ++m_nInitialIters;
-            if (pNew > m_pCur) {
-                m_curResult.clusters = clustersNew;
-                m_pCur = pNew;
-                if (m_pCur > m_pZero) {
-                    m_pZero = m_pCur;
-                }
-
-                if (m_nInitialIters > m_params.nInitialIters) {
-                    Cipher::beamSearch(m_params, *m_freqMap, m_curResult);
-                }
-            }
-
-            m_curResult.pClusters = m_pCur;
-            ++m_curResult.id;
-        }
+        auto clusterings = getClusterings(1);
+        m_curResult = clusterings[0];
+        Cipher::beamSearch(m_params, *m_freqMap, m_curResult);
+        m_curResult.id++;
 
         return true;
     }
@@ -1275,6 +1287,58 @@ namespace Cipher {
 
     const TSimilarityMap & Processor::getSimilarityMap() const {
         return m_similarityMap;
+    }
+
+    float findBestCutoffFreq(const TWaveformF & waveform, EAudioFilter filterId, int64_t sampleRate, float minCutoffFreq_Hz, float maxCutoffFreq_Hz, float step_Hz) {
+        double pClustersBest = -1e10;
+        float freqCutoffBest_Hz = minCutoffFreq_Hz;
+
+        for (float freqCutoff_Hz = minCutoffFreq_Hz; freqCutoff_Hz <= maxCutoffFreq_Hz; freqCutoff_Hz += step_Hz) {
+            TWaveformI16 waveformInput;
+            TWaveformF waveformFiltered = waveform;
+            filter(waveformFiltered, (EAudioFilter) filterId, freqCutoff_Hz, sampleRate);
+
+            if (convert(waveformFiltered, waveformInput) == false) {
+                fprintf(stderr, "%s:%d: convert() failed\n", __FILE__, __LINE__);
+                return minCutoffFreq_Hz;
+            }
+
+            TKeyPressCollectionI16 keyPresses;
+            {
+                TWaveformI16 waveformMax;
+                TWaveformI16 waveformThreshold;
+                if (findKeyPresses(getView(waveformInput, 0), keyPresses, waveformThreshold, waveformMax,
+                                   kFindKeysThreshold, kFindKeysHistorySize, kFindKeysHistorySizeReset, kFindKeysRemoveLowPower) == false) {
+                    fprintf(stderr, "%s:%d: findKeyPresses() failed\n", __FILE__, __LINE__);
+                    return minCutoffFreq_Hz;
+                }
+            }
+
+            TSimilarityMap similarityMap;
+            if (calculateSimilartyMap(kKeyWidth_samples, kKeyAlign_samples, kKeyWidth_samples - kKeyOffset_samples, keyPresses, similarityMap) == false) {
+                fprintf(stderr, "%s:%d: calculateSimilartyMap() failed\n", __FILE__, __LINE__);
+                return minCutoffFreq_Hz;
+            }
+
+            {
+                Cipher::TFreqMap freqMap; // not used for anything
+                Cipher::Processor processor;
+
+                Cipher::TParameters params;
+                params.maxClusters = 50;
+                params.wEnglishFreq = 20.0;
+                processor.init(params, freqMap, similarityMap);
+
+                auto clusteringsCur = processor.getClusterings(1);
+                if (clusteringsCur[0].pClusters > pClustersBest) {
+                    pClustersBest = clusteringsCur[0].pClusters;
+                    freqCutoffBest_Hz = freqCutoff_Hz;
+                }
+                printf("    [findBestCutoffFreq] freqCutoff_Hz = %g, pClusters = %g\n", freqCutoff_Hz, clusteringsCur[0].pClusters);
+            }
+        }
+
+        return freqCutoffBest_Hz;
     }
 
 }

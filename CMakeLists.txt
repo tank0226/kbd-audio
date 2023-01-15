@@ -62,10 +62,9 @@ if (EMSCRIPTEN)
     set(CMAKE_EXE_LINKER_FLAGS " \
     --bind \
     --use-preload-cache \
-    --closure 1 \
     -s ASSERTIONS=1 \
     -s NO_EXIT_RUNTIME=0 \
-    -s PTHREAD_POOL_SIZE=8 \
+    -s PTHREAD_POOL_SIZE=16 \
     -s INITIAL_MEMORY=536870912 \
     ")
 elseif(MINGW)
@@ -224,6 +223,20 @@ if (EMSCRIPTEN)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${TARGET})
 
     set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
+    -s FORCE_FILESYSTEM=1 \
+    -s LZ4=1 \
+    --preload-file ${PROJECT_SOURCE_DIR}/data/ggwords-6-gram.dat.binary@/data/ \
+    ")
+
+    configure_file(${CMAKE_SOURCE_DIR}/index-${TARGET}-tmpl.html ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/index.html @ONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/style.css ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/style.css @ONLY)
+
+    # keytap3-gui
+    set(TARGET keytap3-gui)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${TARGET})
+
+    set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
+    -s TOTAL_MEMORY=536870912 \
     -s FORCE_FILESYSTEM=1 \
     -s LZ4=1 \
     --preload-file ${PROJECT_SOURCE_DIR}/data/ggwords-6-gram.dat.binary@/data/ \

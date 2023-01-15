@@ -11,7 +11,8 @@
 #include <cstdint>
 
 #ifdef __EMSCRIPTEN__
-static constexpr int64_t kSamplesPerFrame = 2048;
+static constexpr int32_t kMaxThreads = 8;
+static constexpr int64_t kSamplesPerFrame = 1024;
 #else
 static constexpr int64_t kSamplesPerFrame = 512;
 #endif
@@ -44,6 +45,14 @@ static constexpr int64_t kBkgrStep_samples = 16;
 static constexpr int64_t kKeyDuration_samples = 0.005f*kSampleRate;
 
 static constexpr float kFreqCutoff_Hz = 100.0f;
+static constexpr float kKeyWidth_samples = 512;
+static constexpr float kKeyAlign_samples = 128;
+static constexpr float kKeyOffset_samples = 128;
+
+static constexpr float kFindKeysThreshold = 8.0f;
+static constexpr int kFindKeysHistorySize = 512;
+static constexpr int kFindKeysHistorySizeReset = 2048;
+static constexpr bool kFindKeysRemoveLowPower = true;
 
 static std::map<char, std::vector<char>> kNearbyKeys = {
     { 'a', { 'a', 'q', 'w', 's', 'z', 'x',                               } },

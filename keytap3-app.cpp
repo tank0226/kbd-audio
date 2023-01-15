@@ -12,6 +12,9 @@
 #include "subbreak3.h"
 #include "audio-logger.h"
 
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
+
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -50,8 +53,10 @@ struct StateRecording {
 
     int nKeysHave = 0;
     bool isStarted = false;
+    std::atomic_bool interrupt = false;
     std::atomic_bool doRecord = false;
     std::atomic_bool doneRecording = false;
+    std::atomic_bool doneCutoffSearch = false;
     size_t totalSize_bytes = 0;
 
     std::string pathOutput = "record.kbd";
@@ -67,14 +72,16 @@ struct StateRecording {
     AudioLogger::Callback cbAudio;
 
     bool init() {
-        if (isStarted && !doneRecording) {
+        if (isStarted) {
             return false;
         }
 
         nKeysHave = 0;
         isStarted = true;
+        interrupt = false;
         doRecord = true;
         doneRecording = false;
+        doneCutoffSearch = false;
         totalSize_bytes = 0;
 
         waveformF.clear();
@@ -90,6 +97,11 @@ struct StateRecording {
                     waveformF.insert(waveformF.end(), frame.begin(), frame.end());
                 }
 
+                if (interrupt) {
+                    doneRecording = true;
+                    printf("\n[!] Recording interrupted\n");
+                    return;
+                }
                 if (nKeysToCapture <= nKeysHave && !doneRecording) {
                     doneRecording = true;
                     printf("\n[+] Done recording\n");
@@ -100,6 +112,7 @@ struct StateRecording {
 
             const auto tEnd = std::chrono::high_resolution_clock::now();
             const auto tDiff = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
+
             if (tDiff > 3) {
                 printf("[!] Audio callback took %ld ms\n", (long) tDiff);
             }
@@ -111,7 +124,7 @@ struct StateRecording {
         parameters.nChannels = nChannels;
         parameters.sampleRate = kSampleRate;
         parameters.filter = EAudioFilter::None;
-        parameters.freqCutoff_Hz = freqCutoff_Hz;
+        parameters.freqCutoff_Hz = kFreqCutoff_Hz;
 
         if (audioLogger.install(std::move(parameters)) == false) {
             fprintf(stderr, "Failed to install audio logger\n");
@@ -130,15 +143,28 @@ struct StateRecording {
         }
     }
 
-    void updateWorker(std::string & dataOutput, float tElapsed) {
+    void updateWorker(std::string & dataOutput, float tElapsed_s) {
         {
             std::lock_guard lock(mutex);
             waveformFWork = waveformF;
         }
         {
+            auto freqCutoffCur_Hz = freqCutoff_Hz;
+
+            if (tElapsed_s < 0.0f && freqCutoffCur_Hz == 0) {
+                const auto tStart = std::chrono::high_resolution_clock::now();
+
+                freqCutoffCur_Hz = Cipher::findBestCutoffFreq(waveformFWork, EAudioFilter::FirstOrderHighPass, kSampleRate, 100.0f, 1000.0f, 100.0f);
+
+                const auto tEnd = std::chrono::high_resolution_clock::now();
+                printf("[+] Found best freqCutoff = %d Hz, took %4.3f seconds\n", freqCutoffCur_Hz, toSeconds(tStart, tEnd));
+            } else {
+                freqCutoffCur_Hz = kFreqCutoff_Hz;
+            }
+
             // apply default filtering, because keypress detection without it is impossible
             auto waveformFFiltered = waveformFWork;
-            ::filter(waveformFFiltered, EAudioFilter::FirstOrderHighPass, kFreqCutoff_Hz, kSampleRate);
+            ::filter(waveformFFiltered, EAudioFilter::FirstOrderHighPass, freqCutoffCur_Hz, kSampleRate);
 
             if (convert(waveformFFiltered, waveformI16) == false) {
                 printf("Conversion failed\n");
@@ -147,23 +173,31 @@ struct StateRecording {
 
         TWaveformI16 waveformMax;
         TWaveformI16 waveformThreshold;
-        if (findKeyPresses(getView(waveformI16, 0), keyPresses, waveformThreshold, waveformMax, 8.0, 512, 2*1024, true) == false) {
+        if (findKeyPresses(getView(waveformI16, 0), keyPresses, waveformThreshold, waveformMax,
+                           kFindKeysThreshold, kFindKeysHistorySize, kFindKeysHistorySizeReset, kFindKeysRemoveLowPower) == false) {
             printf("Failed to detect keypresses\n");
         }
 
         {
             std::lock_guard lock(mutex);
 
+            float cpm = 0.0f;
+            if (keyPresses.size() > 0) {
+                int idx = 0;
+                while (idx < (int) keyPresses.size() && keyPresses[idx].pos < ((int) waveformF.size() - 10*kSampleRate)) {
+                    ++idx;
+                }
+                cpm = 60.0f*(nKeysHave - idx)/std::min(10.0f, (float) waveformF.size()/kSampleRate);
+                dataOutput = "recording " + std::to_string(nKeysHave) + " " + std::to_string(cpm);
+            }
+
             if (nKeysHave < (int) keyPresses.size()) {
                 nKeysHave = keyPresses.size();
-
-                const float cpm = 60.0f*(nKeysHave/tElapsed);
-                dataOutput = "recording " + std::to_string(nKeysHave) + " " + std::to_string(cpm);
 
                 printf("    Detected %d keys. %d left. Average typing speed: %5.2f cpm\n", nKeysHave, nKeysToCapture - nKeysHave, cpm);
             }
 
-            if (tElapsed > 2*60.0f) {
+            if (tElapsed_s > 2*60.0f) {
                 printf("[!] Recording limit reached\n");
                 doneRecording = true;
             }
@@ -173,6 +207,7 @@ struct StateRecording {
 
 struct StateDecoding {
     std::string pathData = "./data";
+    std::atomic_bool interrupt = false;
     TWaveform waveformInput;
     Cipher::TFreqMap freqMap6;
 };
@@ -249,7 +284,7 @@ bool AppInterface::init(State & state) {
     };
 
     setData = [&](const std::string & data) {
-        printf("Received some data from the JS layer: %s\n", data.c_str());
+        //printf("Received some data from the JS layer: %s\n", data.c_str());
 
         std::stringstream ss(data);
 
@@ -262,15 +297,19 @@ bool AppInterface::init(State & state) {
                 if (ss >> nKeysToCapture) {
                     state.recording.nKeysToCapture = nKeysToCapture;
                 } else {
-                    printf("Failed to parse nKeysToCapture. Using: %d\n", state.recording.nKeysToCapture);
+                    printf("[!] Failed to parse nKeysToCapture. Using: %d\n", state.recording.nKeysToCapture);
                 }
 
-                printf("Starting recording. nKeysToCapture: %d\n", state.recording.nKeysToCapture);
+                printf("[+] Starting recording. nKeysToCapture: %d\n", state.recording.nKeysToCapture);
                 state.state = State::Recording;
-                state.recording.init();
             }
         } else if (cmd == "stop") {
-            state.state = State::Idle;
+            if (state.state == State::Recording) {
+                state.recording.interrupt = true;
+            }
+            if (state.state == State::Decoding) {
+                state.decoding.interrupt = true;
+            }
         } else {
             printf("Unknown cmd: %s\n", cmd.c_str());
         }
@@ -317,17 +356,19 @@ bool AppInterface::init(State & state) {
                 } break;
             case State::Recording:
                 {
+                    state.recording.init();
                     state.recording.update();
 
                     if (state.worker.joinable() == false) {
+                        state.dataOutput = "recording 0 0";
                         state.worker = std::thread([&]() {
                             const auto tStart = std::chrono::high_resolution_clock::now();
 
                             while (state.recording.doneRecording == false) {
                                 const auto tNow = std::chrono::high_resolution_clock::now();
-                                const float tElapsed = std::chrono::duration<float>(tNow - tStart).count();
+                                const float tElapsed_s = std::chrono::duration<float>(tNow - tStart).count();
 
-                                state.recording.updateWorker(state.dataOutput, tElapsed);
+                                state.recording.updateWorker(state.dataOutput, tElapsed_s);
 
                                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                             }
@@ -335,35 +376,66 @@ bool AppInterface::init(State & state) {
                             const auto tEnd = std::chrono::high_resolution_clock::now();
 
                             printf("[+] Recording took %4.3f seconds\n", toSeconds(tStart, tEnd));
+
+                            printf("[+] Finding best cutoff frequency ..\n");
+                            state.recording.updateWorker(state.dataOutput, -1.0f);
+
+                            state.recording.doneCutoffSearch = true;
                         });
                     }
 
-                    if (state.recording.doneRecording) {
+                    if (state.recording.doneCutoffSearch) {
                         state.recording.audioLogger.terminate();
+                        state.recording.isStarted = false;
                         state.worker.join();
 
-                        std::ofstream fout(state.recording.pathOutput, std::ios::binary);
-                        if (fout.good() == false) {
-                            fprintf(stderr, "Failed to open file '%s'\n", state.recording.pathOutput.c_str());
-                            return false;
+                        // write record.kbd
+                        {
+                            std::ofstream fout(state.recording.pathOutput, std::ios::binary);
+                            if (fout.good() == false) {
+                                fprintf(stderr, "Failed to open file '%s'\n", state.recording.pathOutput.c_str());
+                                return false;
+                            }
+
+                            state.recording.totalSize_bytes = sizeof(state.recording.waveformF[0])*state.recording.waveformF.size();
+                            fout.write((char *)(state.recording.waveformF.data()), sizeof(state.recording.waveformF[0])*state.recording.waveformF.size());
+                            fout.close();
+
+                            printf("[+] Total data saved: %g MB\n", ((float)(state.recording.totalSize_bytes)/1024.0f/1024.0f));
                         }
 
-                        state.recording.totalSize_bytes = sizeof(state.recording.waveformF[0])*state.recording.waveformF.size();
-                        fout.write((char *)(state.recording.waveformF.data()), sizeof(state.recording.waveformF[0])*state.recording.waveformF.size());
-                        fout.close();
+                        // write record.wav
+                        {
+                            drwav_data_format format;
+                            format.container = drwav_container_riff;
+                            format.format = DR_WAVE_FORMAT_PCM;
+                            format.channels = 1;
+                            format.sampleRate = kSampleRate;
+                            format.bitsPerSample = 16;
 
-                        printf("Total data saved: %g MB\n", ((float)(state.recording.totalSize_bytes)/1024.0f/1024.0f));
+                            printf("[+] Writing WAV data ...\n");
+
+                            drwav wav;
+                            drwav_init_file_write(&wav, "record.wav", &format, NULL);
+                            drwav_uint64 framesWritten = drwav_write_pcm_frames(&wav, state.recording.waveformI16.size(), state.recording.waveformI16.data());
+
+                            printf("[+] WAV frames written = %d\n", (int) framesWritten);
+
+                            drwav_uninit(&wav);
+                        }
+
                         state.dataOutput = "decoding";
 
                         state.decoding.waveformInput = state.recording.waveformI16;
                         state.state = State::Decoding;
-                        printf("Starting decoding\n");
+                        printf("[+] Starting decoding\n");
                     }
                 } break;
             case State::Decoding:
                 {
                     if (state.worker.joinable() == false) {
                         state.workDone = false;
+                        state.decoding.interrupt = false;
                         state.worker = std::thread([&]() {
                             TKeyPressCollection keyPresses;
                             {
@@ -373,7 +445,8 @@ bool AppInterface::init(State & state) {
 
                                 TWaveform waveformMax;
                                 TWaveform waveformThreshold;
-                                if (findKeyPresses(getView(state.decoding.waveformInput, 0), keyPresses, waveformThreshold, waveformMax, 8.0, 512, 2*1024, true) == false) {
+                                if (findKeyPresses(getView(state.decoding.waveformInput, 0), keyPresses, waveformThreshold, waveformMax,
+                                                   kFindKeysThreshold, kFindKeysHistorySize, kFindKeysHistorySizeReset, kFindKeysRemoveLowPower) == false) {
                                     printf("Failed to detect keypresses\n");
                                     return;
                                 }
@@ -384,7 +457,7 @@ bool AppInterface::init(State & state) {
                                 printf("[+] Search took %4.3f seconds\n", toSeconds(tStart, tEnd));
                             }
 
-                            const int n = keyPresses.size();
+                            int n = keyPresses.size();
 
                             TSimilarityMap similarityMap;
                             {
@@ -392,7 +465,7 @@ bool AppInterface::init(State & state) {
 
                                 printf("[+] Calculating CC similarity map\n");
 
-                                if (calculateSimilartyMap(3*256, 3*32, 3*256 - 128, keyPresses, similarityMap) == false) {
+                                if (calculateSimilartyMap(kKeyWidth_samples, kKeyAlign_samples, kKeyWidth_samples - kKeyOffset_samples, keyPresses, similarityMap) == false) {
                                     printf("Failed to calculate similariy map\n");
                                     return;
                                 }
@@ -401,77 +474,125 @@ bool AppInterface::init(State & state) {
 
                                 printf("[+] Calculation took %4.3f seconds\n", toSeconds(tStart, tEnd));
 
-                                const int ncc = std::min(32, n);
-                                for (int j = 0; j < ncc; ++j) {
-                                    printf("%2d: ", j);
-                                    for (int i = 0; i < ncc; ++i) {
-                                        printf("%6.3f ", similarityMap[j][i].cc);
-                                    }
-                                    printf("\n");
-                                }
-                                printf("\n");
-
-                                auto minCC = similarityMap[0][1].cc;
-                                auto maxCC = similarityMap[0][1].cc;
-                                for (int j = 0; j < n - 1; ++j) {
-                                    for (int i = j + 1; i < n; ++i) {
-                                        minCC = std::min(minCC, similarityMap[j][i].cc);
-                                        maxCC = std::max(maxCC, similarityMap[j][i].cc);
-                                    }
-                                }
-
-                                printf("[+] Similarity map: min = %g, max = %g\n", minCC, maxCC);
-                            }
-                            {
-                                Cipher::Processor processor;
-
-                                Cipher::TParameters params;
-                                params.maxClusters = 29;
-                                params.wEnglishFreq = 20.0;
-                                params.nHypothesesToKeep = std::max(100, 2100 - 10*std::min(200, std::max(0, ((int) keyPresses.size() - 100))));
-                                processor.init(params, state.decoding.freqMap6, similarityMap);
-
-                                printf("[+] Attempting to recover the text from the recording. nHypothesesToKeep = %d\n", params.nHypothesesToKeep);
-
-                                std::vector<Cipher::TResult> clusterings;
-
-                                // clustering
                                 {
                                     const auto tStart = std::chrono::high_resolution_clock::now();
 
-                                    for (int nIter = 0; nIter < 16; ++nIter) {
-                                        auto clusteringsCur = processor.getClusterings(params, 32);
+                                    printf("[+] Removing low-similarity keys\n");
 
-                                        for (int i = 0; i < (int) clusteringsCur.size(); ++i) {
-                                            printf("[+] Clustering %d: pClusters = %g\n", i, clusteringsCur[i].pClusters);
-                                            clusterings.push_back(std::move(clusteringsCur[i]));
-                                        }
+                                    const int n0 = keyPresses.size();
 
-                                        params.maxClusters = 29 + 4*(nIter + 1);
-                                        processor.init(params, state.decoding.freqMap6, similarityMap);
+                                    if (removeLowSimilarityKeys(keyPresses, similarityMap, 0.3f) == false) {
+                                        printf("Failed to remove low-similarity keys\n");
+                                        return;
                                     }
+
+                                    const int n1 = keyPresses.size();
 
                                     const auto tEnd = std::chrono::high_resolution_clock::now();
-                                    printf("[+] Clustering took %4.3f seconds\n", toSeconds(tStart, tEnd));
+
+                                    printf("[+] Removed %d low-similarity keys, took %4.3f seconds\n", n0 - n1, toSeconds(tStart, tEnd));
                                 }
 
-                                params.hint.clear();
-                                params.hint.resize(n, -1);
+                                n = keyPresses.size();
 
-                                [[maybe_unused]] int nConverged = 0;
-                                while (true) {
-                                    // beam search
-                                    {
-                                        for (int i = 0; i < (int) clusterings.size(); ++i) {
-                                            Cipher::beamSearch(params, state.decoding.freqMap6, clusterings[i]);
-                                            printf("%8.3f %8.3f ", clusterings[i].p, clusterings[i].pClusters);
-                                            Cipher::printDecoded(clusterings[i].clusters, clusterings[i].clMap, params.hint);
-                                            Cipher::refineNearby(params, state.decoding.freqMap6, clusterings[i]);
+                                if (n > 0) {
+                                    const int ncc = std::min(32, n);
+                                    for (int j = 0; j < ncc; ++j) {
+                                        printf("%2d: ", j);
+                                        for (int i = 0; i < ncc; ++i) {
+                                            printf("%6.3f ", similarityMap[j][i].cc);
+                                        }
+                                        printf("\n");
+                                    }
+                                    printf("\n");
+
+                                    auto minCC = similarityMap[0][1].cc;
+                                    auto maxCC = similarityMap[0][1].cc;
+                                    for (int j = 0; j < n - 1; ++j) {
+                                        for (int i = j + 1; i < n; ++i) {
+                                            minCC = std::min(minCC, similarityMap[j][i].cc);
+                                            maxCC = std::max(maxCC, similarityMap[j][i].cc);
                                         }
                                     }
 
-                                    break;
+                                    printf("[+] Similarity map: min = %g, max = %g\n", minCC, maxCC);
                                 }
+                            }
+
+                            if (n > 0) {
+                                const int nThread = std::min(8, std::max(1, int(std::thread::hardware_concurrency()) - 2));
+
+                                printf("[+] Attempting to recover the text from the recording, nThreads = %d\n", nThread);
+
+                                for (int iMain = 0; iMain < 16; ++iMain) {
+                                    Cipher::Processor processor;
+
+                                    Cipher::TParameters params;
+                                    params.maxClusters = 30;
+                                    params.wEnglishFreq = 30.0;
+                                    params.fSpread = 0.5 + 0.1*iMain;
+                                    params.nHypothesesToKeep = std::max(100, 500 - 2*std::min(200, std::max(0, ((int) keyPresses.size() - 100))));
+                                    processor.init(params, state.decoding.freqMap6, similarityMap);
+
+
+                                    std::vector<Cipher::TResult> clusterings;
+
+                                    // clustering
+                                    {
+                                        const auto tStart = std::chrono::high_resolution_clock::now();
+
+                                        for (int nIter = 0; nIter < 8; ++nIter) {
+                                            auto clusteringsCur = processor.getClusterings(2);
+
+                                            for (int i = 0; i < (int) clusteringsCur.size(); ++i) {
+                                                clusterings.push_back(std::move(clusteringsCur[i]));
+                                            }
+
+                                            params.maxClusters = 30 + 8*(nIter + 1);
+                                            processor.init(params, state.decoding.freqMap6, similarityMap);
+                                        }
+
+                                        const auto tEnd = std::chrono::high_resolution_clock::now();
+                                        printf("[+] Clustering took %4.3f seconds, fSpread = %g\n", toSeconds(tStart, tEnd), params.fSpread);
+                                    }
+
+                                    params.hint.clear();
+                                    params.hint.resize(n, -1);
+
+                                    // beam search
+                                    {
+                                        std::vector<std::thread> workers(std::min(nThread, (int) clusterings.size()));
+
+                                        std::mutex mutexPrint;
+                                        for (int i = 0; i < nThread; ++i) {
+                                            workers[i] = std::thread([&, i]() {
+                                                for (int j = i; j < (int) clusterings.size(); j += nThread) {
+                                                    Cipher::beamSearch(params, state.decoding.freqMap6, clusterings[j]);
+                                                    mutexPrint.lock();
+                                                    printf(" ");
+                                                    Cipher::printDecoded(clusterings[j].clusters, clusterings[j].clMap, params.hint);
+                                                    printf(" [%8.3f %8.3f]\n", clusterings[j].p, clusterings[j].pClusters);
+                                                    mutexPrint.unlock();
+
+                                                    if (state.decoding.interrupt) {
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        for (auto& worker : workers) {
+                                            worker.join();
+                                        }
+
+                                        if (state.decoding.interrupt) {
+                                            printf("\n[!] Analysis interrupted\n");
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                printf("[!] No keys found\n");
                             }
 
                             printf("[+] Done\n");
@@ -514,7 +635,7 @@ int main(int argc, char ** argv) {
     const int captureId     = argm.count("c") == 0 ? 0 : std::stoi(argm.at("c"));
     const int nChannels     = argm.count("C") == 0 ? 0 : std::stoi(argm.at("C"));
     const int filterId      = argm.count("F") == 0 ? EAudioFilter::FirstOrderHighPass : std::stoi(argm.at("F"));
-    const int freqCutoff_Hz = argm.count("f") == 0 ? kFreqCutoff_Hz : std::stoi(argm.at("f"));
+    const int freqCutoff_Hz = argm.count("f") == 0 ? 0 : std::stoi(argm.at("f"));
 
     const int nKeysToCapture = atoi(argv[3]);
 

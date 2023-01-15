@@ -30,16 +30,17 @@ namespace Cipher {
         int maxClusters = 32;
         int nInitialIters = 1000;
         int nIters = 100;
+        double fSpread = 1.0;
 
         // simulated annealing params
-        float temp0 = 0.00001;
-        float coolingRate = 0.9;
+        float temp0 = 0.0001;
+        float coolingRate = 0.95;
 
         // language model
         float wEnglishFreq = 10.0f;
 
         // beam search
-        int nHypothesesToKeep = 100;
+        int nHypothesesToKeep = 500;
 
         THint hint = {};
     };
@@ -119,7 +120,7 @@ namespace Cipher {
 
         bool setHint(const THint & hint);
 
-        std::vector<TResult> getClusterings(const TParameters & params, int nClusterings);
+        std::vector<TResult> getClusterings(int nClusterings);
         bool compute();
 
         int getIters() const { return m_nInitialIters; }
@@ -139,4 +140,12 @@ namespace Cipher {
 
         TResult m_curResult;
     };
+
+    float findBestCutoffFreq(
+            const TWaveformF & waveform,
+            EAudioFilter filterId,
+            int64_t sampleRate,
+            float minCutoffFreq_Hz,
+            float maxCutoffFreq_Hz,
+            float step_Hz);
 }

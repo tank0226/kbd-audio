@@ -12,7 +12,6 @@
 #include <fstream>
 #include <deque>
 #include <algorithm>
-#include <condition_variable>
 
 #ifndef pi
 #define  pi 3.1415926535897932384626433832795
@@ -107,8 +106,8 @@ bool convert(const TWaveformT<TSampleSrc> & src, TWaveformT<TSampleDst> & dst) {
 template bool convert<TSampleF, TSampleI16>(const TWaveformT<TSampleF> & src, TWaveformT<TSampleI16> & dst);
 
 template <typename TSample>
-void filter(TWaveformT<TSample> & waveform, EAudioFilter filter, float freqCutoff_Hz, int64_t sampleRate) {
-    switch (filter) {
+void filter(TWaveformT<TSample> & waveform, EAudioFilter filterId, float freqCutoff_Hz, int64_t sampleRate) {
+    switch (filterId) {
         case EAudioFilter::None:
             {
                 return;
@@ -134,10 +133,10 @@ void filter(TWaveformT<TSample> & waveform, EAudioFilter filter, float freqCutof
             break;
     }
 
-    fprintf(stderr, "Unknown filter type: %d\n", filter);
+    fprintf(stderr, "Unknown filter type: %d\n", filterId);
 }
 
-template void filter<TSampleF>(TWaveformT<TSampleF> & waveform, EAudioFilter filter, float freqCutoff_Hz, int64_t sampleRate);
+template void filter<TSampleF>(TWaveformT<TSampleF> & waveform, EAudioFilter filterId, float freqCutoff_Hz, int64_t sampleRate);
 
 template <typename TSample>
 double calcAbsMax(const TWaveformT<TSample> & waveform) {
@@ -511,21 +510,7 @@ std::tuple<TValueCC, TOffset> findBestCC(
     auto sum02 = std::get<1>(ret);
 
 #ifdef __EMSCRIPTEN__
-    TOffset cbesto = -1;
-    TValueCC cbestcc = -1.0f;
-
-    for (int o = -alignWindow; o <= alignWindow; ++o) {
-        auto cc = calcCC(waveform0, waveform1, sum0, sum02, is00, is0 + o, is1 + o);
-        if (cc > cbestcc) {
-            cbesto = o;
-            cbestcc = cc;
-        }
-    }
-
-    if (cbestcc > bestcc) {
-        bestcc = cbestcc;
-        besto = cbesto;
-    }
+    int nWorkers = std::min(4, std::max(1, int(std::thread::hardware_concurrency()) - 2));
 #else
     int nWorkers = std::min(4u, std::thread::hardware_concurrency());
     std::mutex mutex;
@@ -621,15 +606,12 @@ bool calculateSimilartyMap(
     res.resize(nPresses);
     for (auto & x : res) x.resize(nPresses);
 
-    int nFinished = 0;
 #ifdef __EMSCRIPTEN__
-    int nWorkers = std::max(1, std::min(4, int(std::thread::hardware_concurrency()) - 4));
+    int nWorkers = std::min(kMaxThreads, std::max(1, int(std::thread::hardware_concurrency()) - 2));
 #else
     int nWorkers = std::thread::hardware_concurrency();
 #endif
 
-    std::mutex mutex;
-    std::condition_variable cv;
     std::vector<std::thread> workers(nWorkers);
     for (int iw = 0; iw < (int) workers.size(); ++iw) {
         auto & worker = workers[iw];
@@ -668,18 +650,10 @@ bool calculateSimilartyMap(
                 }
                 avgcc /= (nPresses - 1);
             }
-
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                ++nFinished;
-                cv.notify_one();
-            }
         }, iw);
-        worker.detach();
     }
 
-    std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&]() { return nFinished == nWorkers; });
+    for (auto & worker : workers) worker.join();
 
     return true;
 }
@@ -700,15 +674,12 @@ bool calculateSimilartyMap(
     res.resize(nPresses);
     for (auto & x : res) x.resize(nPresses);
 
-    int nFinished = 0;
 #ifdef __EMSCRIPTEN__
-    int nWorkers = std::max(1, std::min(4, int(std::thread::hardware_concurrency()) - 4));
+    int nWorkers = std::min(kMaxThreads, std::max(1, int(std::thread::hardware_concurrency()) - 2));
 #else
     int nWorkers = std::thread::hardware_concurrency();
 #endif
 
-    std::mutex mutex;
-    std::condition_variable cv;
     std::vector<std::thread> workers(nWorkers);
     for (int iw = 0; iw < (int) workers.size(); ++iw) {
         auto & worker = workers[iw];
@@ -747,18 +718,10 @@ bool calculateSimilartyMap(
                 }
                 avgcc /= (nPresses - 1);
             }
-
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                ++nFinished;
-                cv.notify_one();
-            }
         }, iw);
-        worker.detach();
     }
 
-    std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&]() { return nFinished == nWorkers; });
+    for (auto & worker : workers) worker.join();
 
     return true;
 }
@@ -1188,3 +1151,72 @@ bool adjustKeyPresses(TKeyPressCollectionT<T> & keyPresses, TSimilarityMap & sim
 }
 
 template bool adjustKeyPresses<TSampleI16>(TKeyPressCollectionT<TSampleI16> & keyPresses, TSimilarityMap & sim);
+
+
+template<typename T>
+bool removeLowSimilarityKeys(TKeyPressCollectionT<T> & keyPresses, TSimilarityMap & sim, double threshold) {
+    const int n = keyPresses.size();
+    if (n != (int) sim.size()) {
+        fprintf(stderr, "removeLowSimilarityKeys: n != sim.size()\n");
+        return false;
+    }
+
+    std::vector<bool> used(n, false);
+
+    for (int i = 0; i < n; ++i) {
+        if (used[i]) continue;
+
+        for (int j = 0 ; j < n; ++j) {
+            if (i == j) continue;
+
+            if (sim[i][j].cc > threshold) {
+                used[i] = true;
+                used[j] = true;
+                break;
+            }
+        }
+    }
+
+    int nRemoved = 0;
+    for (int i = 0; i < n; ++i) {
+        if (used[i]) continue;
+
+        //keyPresses.erase(keyPresses.begin() + i - nRemoved);
+        ++nRemoved;
+    }
+
+    if (nRemoved == 0) {
+        return true;
+    }
+
+    auto keyPresses0 = keyPresses;
+    keyPresses.clear();
+
+    for (int i = 0; i < n; ++i) {
+        if (used[i]) {
+            keyPresses.push_back(keyPresses0[i]);
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        auto cur = sim[i];
+        sim[i].clear();
+        for (int j = 0; j < n; ++j) {
+            if (used[j]) {
+                sim[i].push_back(cur[j]);
+            }
+        }
+    }
+
+    auto sim0 = sim;
+    sim.clear();
+    for (int i = 0; i < n; ++i) {
+        if (used[i]) {
+            sim.push_back(sim0[i]);
+        }
+    }
+
+    return true;
+}
+
+template bool removeLowSimilarityKeys<TSampleI16>(TKeyPressCollectionT<TSampleI16> & keyPresses, TSimilarityMap & sim, double threshold);

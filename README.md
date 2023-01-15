@@ -14,22 +14,38 @@ Check this blog post for more details:
 
 [Video: short demo of Keytap in action](https://www.youtube.com/watch?v=2OjzI9m7W10)
 
+[Try it online:](https://ggerganov.github.io/keytap)
+
+<a href="https://ggerganov.github.io/keytap" target="_blank"><img src="https://i.imgur.com/FXa60Pr.gif" style="display: inline-block; overflow: hidden; width: 99%;"></img></a>
+
 ### Keytap2
 
-The **keytap2** tool is another interesting tool for recovering text from audio. It does not require training data - instead it uses statistical information about the frequencies of the letters and n-grams in the English language. A more detailed description of the tool is available here: [Keytap2 discussion](https://github.com/ggerganov/kbd-audio/discussions/31)
+The **keytap2** tool is another interesting tool for recovering text from audio. It does not require training data - instead it uses statistical information about the frequencies of the letters and n-grams in the English language.
 
-[Online demo using WASM](https://keytap2.ggerganov.com)
+A more detailed description of the tool is available here: [Keytap2 discussion](https://github.com/ggerganov/kbd-audio/discussions/31)
 
 [Video: short demo of Keytap2 in action](https://www.youtube.com/watch?v=jNtw17S6SR0)
 
 [CTF: can you guess the text being typed?](https://ggerganov.github.io/keytap-challenge/)
 
+[Try it online:](https://keytap2.ggerganov.com)
+
+<a href="https://keytap2.ggerganov.com" target="_blank"><img src="https://i.imgur.com/nPlLEDN.jpg" style="display: inline-block; overflow: hidden; width: 99%;"></img></a>
+
 ### Keytap3
 
-This version introduces significant algorithm improvements and better n-gram statistics. The attack is now fully
-automated and and does not require any manual intervation during the decoding process.
+This version introduces significant algorithm improvements and better n-gram statistics compared to keytap2. The attack is now fully
+automated and does not require any manual intervation during the text recovery process.
 
-[Check if your keyboard is vulnerable to Keytap](https://keytap3.ggerganov.com)
+[Video: short demo of using Keytap3](https://youtu.be/5aphvxpSt3o)
+
+[Video: another example of using Keytap3](https://youtu.be/kCOrxrR-4ak)
+
+[GUI for Keytap3](https://keytap3-gui.ggerganov.com)
+
+[Check if your keyboard is vulnerable to Keytap:](https://keytap3.ggerganov.com)
+
+<a href="https://keytap3.ggerganov.com" target="_blank"><img src="https://user-images.githubusercontent.com/1991296/166096331-ab26f7f8-08e0-48d6-abd7-57017ebf1866.JPEG" style="display: inline-block; overflow: hidden; width: 99%;"></img></a>
 
 ### What people say about Keytap
 
@@ -87,6 +103,7 @@ Short summary of the available tools. If the status of the tool is not **stable*
 | **keytap-gui**      | gui     | **stable**  |
 | **keytap2-gui**     | gui     | **stable**  |
 | **keytap3**         | text    | **stable**  |
+| **keytap3-gui**     | gui     | **stable**  |
 | -                   | *extra* | -           |
 | **guess-qp**        | text    | experiment  |
 | **guess-qp2**       | text    | experiment  |
@@ -95,7 +112,6 @@ Short summary of the available tools. If the status of the tool is not **stable*
 | **subreak**         | text    | experiment  |
 | **key-average-gui** | gui     | experiment  |
 | **keytap2**         | text    | experiment  |
-| **keytap3-gui**     | gui     | experiment  |
 
 ## Tool details
 
@@ -145,9 +161,7 @@ Short summary of the available tools. If the status of the tool is not **stable*
 
       ./keytap-gui input0.kbd [input1.kbd] [input2.kbd] ... [-cN] [-CN]
 
-  [**Live demo *(WebAssembly threads required)* **](https://ggerganov.github.io/keytap)
-
-  <a href="https://i.imgur.com/mnRvT1X.gif" target="_blank">![keytap-gui](https://i.imgur.com/FXa60Pr.gif)</a>
+  Online demo: https://keytap.ggerganov.com
 
   ---
 
@@ -157,7 +171,7 @@ Short summary of the available tools. If the status of the tool is not **stable*
 
       ./keytap2-gui record.kbd ../data
 
-  <a href="https://i.imgur.com/nPlLEDN.jpg" target="_blank">![keytap2-gui](https://i.imgur.com/nPlLEDN.jpg)</a>
+  Online demo: https://keytap2.ggerganov.com
 
   ---
 
@@ -168,6 +182,16 @@ Short summary of the available tools. If the status of the tool is not **stable*
       ./keytap3 input.kbd ../data [-cN] [-CN] [-pF] [-tF] [-FN] [-fN]
 
   Online demo: https://keytap3.ggerganov.com
+
+  ---
+
+* **keytap3-gui**
+
+  GUI version of the **keytap3** tool.
+
+      ./keytap3-gui input.kbd ../data [-cN] [-CN] [-pF] [-tF] [-FN] [-fN]
+
+  Online demo: https://keytap3-gui.ggerganov.com
 
   ---
 
